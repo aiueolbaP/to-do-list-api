@@ -1,0 +1,115 @@
+stages:
+  - build
+  - test
+  - quality
+  - packing
+  - deploy
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  EC2_HOST: "3.145.138.105"
+  EC2_USER: "ubuntu"
+  APP_DIR: "/home/ubuntu/to-do-list-api"
+
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - .m2/repository
+
+# ==========================================
+# 1. ETAPA DE CONSTRUCCIÓN (BUILD)
+# ==========================================
+build:
+  stage: build
+  image: maven:3.9-eclipse-temurin-21-alpine
+  script:
+    - echo "=== Iniciando etapa de compilación del proyecto ==="
+    - chmod +x ./mvnw || true
+    - ./mvnw compile
+  artifacts:
+    paths:
+      - target/classes/
+    expire_in: 1 hour
+
+# ==========================================
+# 2. ETAPA DE PRUEBAS UNITARIAS (TEST)
+# ==========================================
+test:
+  stage: test
+  image: maven:3.9-eclipse-temurin-21-alpine
+  script:
+    - echo "=== Ejecutando pruebas unitarias ==="
+    - chmod +x ./mvnw || true
+    - ./mvnw test
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - target/surefire-reports/TEST-*.xml
+    paths:
+      - target/surefire-reports/
+    expire_in: 1 week
+
+# ==========================================
+# 3. ETAPA DE CALIDAD Y EMPAQUETADO (QUALITY & PACKAGING)
+# ==========================================
+quality:
+  stage: quality
+  image: maven:3.9-eclipse-temurin-21-alpine
+  script:
+    - echo "=== Verificando calidad y empaquetando la aplicación ==="
+    - chmod +x ./mvnw || true
+    - ./mvnw package -DskipTests
+    - echo "Generando estructura build/libs compatible con la etapa de packing"
+    - mkdir -p build/libs
+    - cp target/*.jar build/libs/to-do-list-api-0.0.1-SNAPSHOT.jar
+    - ls -la build/libs/
+  artifacts:
+    paths:
+      - build/libs/to-do-list-api-0.0.1-SNAPSHOT.jar
+      - target/*.jar
+    expire_in: 1 day
+
+# ==========================================
+# 4. ETAPA DE EMPAQUETADO Y TRANSFERENCIA (PACKING)
+# ==========================================
+packing:
+  stage: packing
+  image: alpine:latest
+  before_script:
+    # Instalar SSH
+    - apk update && apk add --no-cache openssh-client
+  script:
+    - echo "Ajustando los permisos de la clave"
+    - if [ -f "/builds/202510/to-do-list.tmp/AWS_KEY" ]; then chmod 600 /builds/202510/to-do-list.tmp/AWS_KEY; fi
+    - if [ -n "$AWS_KEY" ] && [ -f "$AWS_KEY" ]; then chmod 600 "$AWS_KEY"; fi
+    - echo "Conectando a EC2 para copiar la nueva version de la aplicación"
+    - ssh -o StrictHostKeyChecking=no -i $AWS_KEY ubuntu@3.145.138.105 "mkdir -p /home/ubuntu/to-do-list-api"
+    - scp -o StrictHostKeyChecking=no -i $AWS_KEY build/libs/to-do-list-api-0.0.1-SNAPSHOT.jar ubuntu@3.145.138.105:/home/ubuntu/to-do-list-api/api.jar
+  dependencies:
+    - quality
+
+# ==========================================
+# 5. ETAPA DE DESPLIEGUE (DEPLOY)
+# ==========================================
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    # Instalar SSH
+    - apk update && apk add --no-cache openssh-client
+  script:
+    - echo "Ajustando los permisos de la clave"
+    - if [ -f "/builds/202510/to-do-list.tmp/AWS_KEY" ]; then chmod 600 /builds/202510/to-do-list.tmp/AWS_KEY; fi
+    - if [ -n "$AWS_KEY" ] && [ -f "$AWS_KEY" ]; then chmod 600 "$AWS_KEY"; fi
+    - echo "Conectando a EC2 para desplegar la aplicación"
+    - echo "Detiene cualquier instancia previa de la API en ejecución"
+    - nohup ssh -o StrictHostKeyChecking=no -i $AWS_KEY ubuntu@3.145.138.105 "nohup pkill -f 'java -jar' > /dev/null 2>&1 &" || true
+    - sleep 2
+    - echo "Ejecuta la nueva versión en segundo plano"
+    - nohup ssh -o StrictHostKeyChecking=no -i $AWS_KEY ubuntu@3.145.138.105 "nohup java -jar /home/ubuntu/to-do-list-api/api.jar > /home/ubuntu/to-do-list-api/app.log 2>&1 &"
+    - echo "Esperando arranque y verificando estado del servicio"
+    - sleep 5
+    - ssh -o StrictHostKeyChecking=no -i $AWS_KEY ubuntu@3.145.138.105 "pgrep -f 'java -jar' && echo 'Despliegue finalizado con éxito: Proceso activo' || echo 'Atención: Verifique /home/ubuntu/to-do-list-api/app.log'"
+  environment: production
+  dependencies: []
